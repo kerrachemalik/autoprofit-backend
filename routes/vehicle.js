@@ -1,0 +1,77 @@
+const express = require("express");
+const router = express.Router();
+const { requireAuth } = require("../middleware/auth");
+
+const FREE_WEEKLY_LIMIT = 3;
+
+module.exports = (pool) => {
+  // Identifie un véhicule à partir d'une plaque/VIN.
+  // Branche ici ton fournisseur réel (voir .env : VEHICLE_API_PROVIDER / VEHICLE_API_KEY).
+  router.post("/lookup", requireAuth, async (req, res) => {
+    const { plate } = req.body;
+    if (!plate) return res.status(400).json({ error: "Plaque ou VIN requis." });
+
+    if (process.env.VEHICLE_API_KEY) {
+      // TODO : remplacer par le vrai appel à ton fournisseur (ex: api-plaque-immatriculation.com)
+      // const providerRes = await fetch(`https://.../lookup?plate=${plate}`, {
+      //   headers: { Authorization: `Bearer ${process.env.VEHICLE_API_KEY}` }
+      // });
+      // return res.json(await providerRes.json());
+    }
+
+    // Fallback démonstration tant qu'aucun fournisseur n'est configuré
+    return res.json({
+      isDemo: true,
+      message: "Aucun fournisseur réel configuré (VEHICLE_API_KEY manquante) — réponse de démonstration.",
+    });
+  });
+
+  // Calcule le prix de marché pour un véhicule donné.
+  // Branche ici ta base de comparables ou un fournisseur de cote licencié.
+  router.post("/market", requireAuth, async (req, res) => {
+    if (process.env.MARKET_DATA_API_KEY) {
+      // TODO : remplacer par le vrai appel à ton fournisseur de cote
+    }
+    return res.json({
+      isDemo: true,
+      message: "Aucun fournisseur de données de marché configuré — réponse de démonstration.",
+    });
+  });
+
+  // Enregistre une analyse : vérifie le quota gratuit (3/semaine), incrémente le compteur.
+  router.post("/analyses", requireAuth, async (req, res) => {
+    const userResult = await pool.query("SELECT is_premium FROM users WHERE email = $1", [req.userEmail]);
+    const isPremium = userResult.rows[0]?.is_premium;
+
+    if (!isPremium) {
+      const countResult = await pool.query(
+        "SELECT COUNT(*) FROM analyses WHERE user_email = $1 AND created_at > now() - interval '7 days'",
+        [req.userEmail]
+      );
+      const usedThisWeek = parseInt(countResult.rows[0].count, 10);
+      if (usedThisWeek >= FREE_WEEKLY_LIMIT) {
+        return res.status(403).json({ error: "Quota gratuit atteint (3 analyses/semaine). Passe Premium pour continuer." });
+      }
+    }
+
+    const { vehicleName, plate, purchasePrice, margin, score, verdict } = req.body;
+    const result = await pool.query(
+      `INSERT INTO analyses (user_email, vehicle_name, plate, purchase_price, margin, score, verdict)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+      [req.userEmail, vehicleName, plate, purchasePrice, margin, score, verdict]
+    );
+    await pool.query("UPDATE users SET analyses_count = analyses_count + 1 WHERE email = $1", [req.userEmail]);
+    res.json(result.rows[0]);
+  });
+
+  // Historique des analyses de l'utilisateur connecté
+  router.get("/analyses", requireAuth, async (req, res) => {
+    const result = await pool.query(
+      "SELECT * FROM analyses WHERE user_email = $1 ORDER BY created_at DESC",
+      [req.userEmail]
+    );
+    res.json(result.rows);
+  });
+
+  return router;
+};
