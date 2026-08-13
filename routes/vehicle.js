@@ -1,9 +1,9 @@
 const express = require("express");
 const router = express.Router();
 const { requireAuth } = require("../middleware/auth");
-
+ 
 const FREE_WEEKLY_LIMIT = 3;
-
+ 
 // Décode les entités XML de base (&quot; &amp; &lt; &gt; &#39;) présentes dans
 // la réponse SOAP/ASMX de RegCheck avant de parser le JSON qu'elle contient.
 function decodeXmlEntities(str) {
@@ -14,16 +14,56 @@ function decodeXmlEntities(str) {
     .replace(/&#39;/g, "'")
     .replace(/&amp;/g, "&");
 }
-
+ 
+// Un VIN fait 17 caractères et ne contient jamais I, O ou Q (norme ISO 3779)
+function isVin(value) {
+  return /^[A-HJ-NPR-Z0-9]{17}$/i.test(value.replace(/\s/g, ""));
+}
+ 
+// Décode un VIN via l'API officielle NHTSA (gratuite, sans clé, sans inscription).
+// Fonctionne pour les véhicules du monde entier grâce à la norme ISO 3779,
+// même si les données sont parfois moins complètes hors des véhicules vendus aux USA.
+async function decodeVin(vin) {
+  const cleanVin = vin.replace(/\s/g, "").toUpperCase();
+  const url = `https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVinValues/${encodeURIComponent(cleanVin)}?format=json`;
+  const providerRes = await fetch(url);
+  const data = await providerRes.json();
+  const r = data.Results && data.Results[0];
+  if (!r || !r.Make) throw new Error("VIN non reconnu par la base NHTSA.");
+  return {
+    isDemo: false,
+    vin: cleanVin,
+    marque: r.Make,
+    modele: r.Model,
+    annee: r.ModelYear,
+    carburant: r.FuelTypePrimary,
+    cylindree: r.DisplacementL,
+    cylindres: r.EngineCylinders,
+    boite: r.TransmissionStyle,
+    carrosserie: r.BodyClass,
+    portes: r.Doors,
+    puissanceCh: r.EngineHP,
+  };
+}
+ 
 module.exports = (pool) => {
-  // Identifie un véhicule à partir d'une plaque française via RegCheck.org.uk
-  // (même fournisseur qu'ImmatriculationAPI.com). VEHICLE_API_KEY doit contenir
-  // le "username" du compte RegCheck (pas une clé au sens strict).
+  // Identifie un véhicule à partir d'une plaque française (RegCheck) ou d'un VIN (NHTSA, gratuit).
   router.post("/lookup", requireAuth, async (req, res) => {
     const { plate } = req.body;
     if (!plate) return res.status(400).json({ error: "Plaque ou VIN requis." });
-
-    if (process.env.VEHICLE_API_KEY) {
+ 
+    // VIN : décodage gratuit, toujours tenté en premier si le format correspond
+    if (isVin(plate)) {
+      try {
+        const vehicleData = await decodeVin(plate);
+        return res.json(vehicleData);
+      } catch (e) {
+        console.error("Erreur décodage VIN (NHTSA) :", e.message);
+        // On retombe sur la démonstration ci-dessous plutôt que de bloquer l'utilisateur
+      }
+    } else if (process.env.VEHICLE_API_KEY) {
+      // Plaque française via RegCheck.org.uk (même fournisseur qu'ImmatriculationAPI.com).
+      // VEHICLE_API_KEY doit contenir le "username" du compte RegCheck.
       try {
         const cleanPlate = plate.replace(/[\s-]/g, "").toUpperCase();
         const url = `https://www.regcheck.org.uk/api/reg.asmx/CheckFrance?RegistrationNumber=${encodeURIComponent(cleanPlate)}&username=${encodeURIComponent(process.env.VEHICLE_API_KEY)}`;
@@ -38,14 +78,14 @@ module.exports = (pool) => {
         // On retombe sur la démonstration plutôt que de bloquer l'utilisateur
       }
     }
-
+ 
     // Fallback démonstration tant qu'aucun fournisseur n'est configuré (ou en cas d'échec)
     return res.json({
       isDemo: true,
-      message: "Aucun fournisseur réel configuré (VEHICLE_API_KEY manquante) — réponse de démonstration.",
+      message: "Aucun fournisseur réel configuré ou VIN non reconnu — réponse de démonstration.",
     });
   });
-
+ 
   // Calcule le prix de marché pour un véhicule donné.
   // Branche ici ta base de comparables ou un fournisseur de cote licencié.
   router.post("/market", requireAuth, async (req, res) => {
@@ -57,12 +97,12 @@ module.exports = (pool) => {
       message: "Aucun fournisseur de données de marché configuré — réponse de démonstration.",
     });
   });
-
+ 
   // Enregistre une analyse : vérifie le quota gratuit (3/semaine), incrémente le compteur.
   router.post("/analyses", requireAuth, async (req, res) => {
     const userResult = await pool.query("SELECT is_premium FROM users WHERE email = $1", [req.userEmail]);
     const isPremium = userResult.rows[0]?.is_premium;
-
+ 
     if (!isPremium) {
       const countResult = await pool.query(
         "SELECT COUNT(*) FROM analyses WHERE user_email = $1 AND created_at > now() - interval '7 days'",
@@ -73,7 +113,7 @@ module.exports = (pool) => {
         return res.status(403).json({ error: "Quota gratuit atteint (3 analyses/semaine). Passe Premium pour continuer." });
       }
     }
-
+ 
     const { vehicleName, plate, purchasePrice, margin, score, verdict } = req.body;
     const result = await pool.query(
       `INSERT INTO analyses (user_email, vehicle_name, plate, purchase_price, margin, score, verdict)
@@ -83,7 +123,7 @@ module.exports = (pool) => {
     await pool.query("UPDATE users SET analyses_count = analyses_count + 1 WHERE email = $1", [req.userEmail]);
     res.json(result.rows[0]);
   });
-
+ 
   // Historique des analyses de l'utilisateur connecté
   router.get("/analyses", requireAuth, async (req, res) => {
     const result = await pool.query(
@@ -92,6 +132,7 @@ module.exports = (pool) => {
     );
     res.json(result.rows);
   });
-
+ 
   return router;
 };
+ 
