@@ -5,6 +5,11 @@ const helmet = require("helmet");
 const { Pool } = require("pg");
  
 const app = express();
+// Render (comme la plupart des hébergeurs) place le serveur derrière un proxy.
+// Sans cette ligne, express-rate-limit plante à chaque requête car il ne sait
+// pas s'il peut faire confiance à l'en-tête X-Forwarded-For transmis par Render.
+app.set("trust proxy", 1);
+ 
 // Supabase exige une connexion chiffrée (SSL). Sans cette option, la connexion
 // échoue et provoquait un plantage complet du serveur (crash au lieu d'une
 // simple erreur affichée).
