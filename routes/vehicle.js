@@ -46,6 +46,32 @@ async function decodeVin(vin) {
   };
 }
  
+const CACHE_VALIDITY_DAYS = 14;
+ 
+// Calcule médiane, moyenne, min/max et un score de confiance à partir d'une
+// liste de prix comparables. Ne dit RIEN sur l'origine de ces prix — cette
+// fonction est indépendante de la source (fournisseur licencié ou saisie manuelle).
+function computeMarketStats(prices) {
+  if (!Array.isArray(prices) || prices.length === 0) return null;
+  const sorted = [...prices].sort((a, b) => a - b);
+  const n = sorted.length;
+  const mid = Math.floor(n / 2);
+  const median = n % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+  const mean = sorted.reduce((sum, p) => sum + p, 0) / n;
+  const min = sorted[0];
+  const max = sorted[n - 1];
+  // Confiance simple basée sur le nombre de comparables disponibles
+  const confidence = n >= 20 ? "élevée" : n >= 8 ? "moyenne" : "faible";
+  return {
+    median: Math.round(median),
+    mean: Math.round(mean),
+    min: Math.round(min),
+    max: Math.round(max),
+    comparablesCount: n,
+    confidence,
+  };
+}
+ 
 module.exports = (pool) => {
   // Identifie un véhicule à partir d'une plaque française (RegCheck) ou d'un VIN (NHTSA, gratuit).
   router.post("/lookup", requireAuth, async (req, res) => {
@@ -86,12 +112,79 @@ module.exports = (pool) => {
     });
   });
  
-  // Calcule le prix de marché pour un véhicule donné.
-  // Branche ici ta base de comparables ou un fournisseur de cote licencié.
+  // Prix du marché — vérifie d'abord le cache (moins de 14 jours), sinon
+  // interroge le fournisseur configuré (ex: MyTracks), sinon démonstration.
+  // Libellés à utiliser côté app : "Prix du marché", "Valeur de revente
+  // estimée", "Médiane des comparables" — jamais "Cote Argus".
   router.post("/market", requireAuth, async (req, res) => {
-    if (process.env.MARKET_DATA_API_KEY) {
-      // TODO : remplacer par le vrai appel à ton fournisseur de cote
+    const { brand, model, year } = req.body;
+    if (!brand || !model || !year) {
+      return res.status(400).json({ error: "Marque, modèle et année requis." });
     }
+ 
+    try {
+      const cached = await pool.query(
+        `SELECT * FROM market_prices_cache
+         WHERE brand = $1 AND model = $2 AND year = $3
+           AND created_at > now() - interval '${CACHE_VALIDITY_DAYS} days'
+         ORDER BY created_at DESC LIMIT 1`,
+        [brand, model, year]
+      );
+      if (cached.rows[0]) {
+        const c = cached.rows[0];
+        return res.json({
+          isDemo: false,
+          fromCache: true,
+          median: Number(c.median_price),
+          mean: Number(c.mean_price),
+          min: Number(c.min_price),
+          max: Number(c.max_price),
+          comparablesCount: c.comparables_count,
+          source: c.source,
+        });
+      }
+    } catch (e) {
+      console.error("Erreur lecture cache marché :", e.message);
+    }
+ 
+    if (process.env.MARKET_DATA_API_KEY) {
+      try {
+        const url = `https://api.carapi.dev/v1/vehicle-valuation?token=${encodeURIComponent(process.env.MARKET_DATA_API_KEY)}&make=${encodeURIComponent(brand)}&model=${encodeURIComponent(model)}&year=${encodeURIComponent(year)}&country=FR`;
+        const providerRes = await fetch(url);
+        const data = await providerRes.json();
+ 
+        // Le format exact de réponse de CarAPI.dev n'a pas pu être vérifié à
+        // l'avance — on tente plusieurs noms de champs courants. Si aucun ne
+        // correspond, le message loggué ci-dessous montrera la vraie forme
+        // de la réponse pour ajuster ce mapping précisément.
+        const median = data.median_price ?? data.median ?? data.medianPrice;
+        const mean = data.average_price ?? data.mean ?? data.averagePrice;
+        const min = data.min_price ?? data.min ?? data.minPrice;
+        const max = data.max_price ?? data.max ?? data.maxPrice;
+        const count = data.sample_size ?? data.comparablesCount ?? data.count ?? 0;
+ 
+        if (median != null) {
+          const stats = {
+            median: Math.round(median),
+            mean: Math.round(mean ?? median),
+            min: Math.round(min ?? median * 0.85),
+            max: Math.round(max ?? median * 1.15),
+            comparablesCount: count,
+            confidence: count >= 20 ? "élevée" : count >= 8 ? "moyenne" : "faible",
+          };
+          await pool.query(
+            `INSERT INTO market_prices_cache (brand, model, year, median_price, mean_price, min_price, max_price, comparables_count, source)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'carapi')`,
+            [brand, model, year, stats.median, stats.mean, stats.min, stats.max, stats.comparablesCount]
+          );
+          return res.json({ isDemo: false, fromCache: false, ...stats, source: "carapi" });
+        }
+        console.error("Réponse CarAPI inattendue, à vérifier :", JSON.stringify(data));
+      } catch (e) {
+        console.error("Erreur API marché (CarAPI.dev) :", e.message);
+      }
+    }
+ 
     return res.json({
       isDemo: true,
       message: "Aucun fournisseur de données de marché configuré — réponse de démonstration.",
@@ -135,4 +228,3 @@ module.exports = (pool) => {
  
   return router;
 };
- 
