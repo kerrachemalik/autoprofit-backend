@@ -112,16 +112,15 @@ module.exports = (pool) => {
     });
   });
  
-  // Prix du marché — vérifie d'abord le cache (moins de 14 jours), sinon
-  // interroge le fournisseur configuré (ex: MyTracks), sinon démonstration.
-  // Libellés à utiliser côté app : "Prix du marché", "Valeur de revente
-  // estimée", "Médiane des comparables" — jamais "Cote Argus".
+  // Prix du marché — vérifie d'abord le cache (moins de 14 jours),
+  // sinon interroge l'Edge Function Supabase (get-market-price).
   router.post("/market", requireAuth, async (req, res) => {
     const { brand, model, year, km, fuel } = req.body;
     if (!brand || !model || !year) {
       return res.status(400).json({ error: "Marque, modèle et année requis." });
     }
  
+    // 1. Vérification dans le cache PostgreSQL local (évite de ré-exécuter Apify si l'analyse est récente)
     try {
       const cached = await pool.query(
         `SELECT * FROM market_prices_cache
@@ -147,59 +146,64 @@ module.exports = (pool) => {
       console.error("Erreur lecture cache marché :", e.message);
     }
  
-    if (process.env.MARKET_DATA_API_KEY) {
-      try {
-        const providerRes = await fetch("https://api.mytracks.fr/v1/pricing", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "X-API-Key": process.env.MARKET_DATA_API_KEY,
-          },
-          body: JSON.stringify({
-            brand,
-            model,
-            year: Number(year),
-            mileage: km ? Number(km) : undefined,
-            fuel: fuel || undefined,
-          }),
-        });
-        const data = await providerRes.json();
- 
-        // Le format exact de réponse de MyTracks n'a pas pu être vérifié à
-        // l'avance — on tente plusieurs noms de champs courants. Si aucun ne
-        // correspond, le message loggué ci-dessous montrera la vraie forme
-        // de la réponse pour ajuster ce mapping précisément.
-        const median = data.price ?? data.median_price ?? data.median ?? data.estimated_price ?? data.medianPrice;
-        const mean = data.average_price ?? data.mean ?? data.averagePrice;
-        const min = data.min_price ?? data.price_min ?? data.min ?? data.minPrice;
-        const max = data.max_price ?? data.price_max ?? data.max ?? data.maxPrice;
-        const count = data.sample_size ?? data.comparablesCount ?? data.count ?? 0;
- 
-        if (median != null) {
-          const stats = {
-            median: Math.round(median),
-            mean: Math.round(mean ?? median),
-            min: Math.round(min ?? median * 0.85),
-            max: Math.round(max ?? median * 1.15),
-            comparablesCount: count,
-            confidence: count >= 20 ? "élevée" : count >= 8 ? "moyenne" : "faible",
-          };
+    // 2. Appel direct à l'Edge Function Supabase
+    try {
+      const supabaseUrl = process.env.SUPABASE_URL;
+      const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
+
+      const providerRes = await fetch(`${supabaseUrl}/functions/v1/get-market-price`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${supabaseAnonKey}`,
+        },
+        body: JSON.stringify({
+          marque: brand,
+          modele: model,
+          annee: Number(year),
+          kilometrage: km ? Number(km) : undefined,
+          carburant: fuel || undefined,
+        }),
+      });
+
+      const data = await providerRes.json();
+
+      if (data && (data.prixMediane != null || data.median != null)) {
+        const median = data.prixMediane ?? data.median;
+        const mean = data.prixMoyenne ?? data.mean ?? median;
+        const min = data.prixMin ?? data.min ?? Math.round(median * 0.85);
+        const max = data.prixMax ?? data.max ?? Math.round(median * 1.15);
+        const count = data.nombreAnnonces ?? data.comparablesCount ?? 0;
+
+        const stats = {
+          median: Math.round(median),
+          mean: Math.round(mean),
+          min: Math.round(min),
+          max: Math.round(max),
+          comparablesCount: count,
+          confidence: count >= 20 ? "élevée" : count >= 8 ? "moyenne" : "faible",
+        };
+
+        // Sauvegarde dans le cache local
+        try {
           await pool.query(
             `INSERT INTO market_prices_cache (brand, model, year, median_price, mean_price, min_price, max_price, comparables_count, source)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'mytracks')`,
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'apify-supabase')`,
             [brand, model, year, stats.median, stats.mean, stats.min, stats.max, stats.comparablesCount]
           );
-          return res.json({ isDemo: false, fromCache: false, ...stats, source: "mytracks" });
+        } catch (cacheErr) {
+          console.error("Erreur écriture cache :", cacheErr.message);
         }
-        console.error("Réponse MyTracks inattendue, à vérifier :", JSON.stringify(data));
-      } catch (e) {
-        console.error("Erreur API marché (MyTracks) :", e.message);
+
+        return res.json({ isDemo: false, fromCache: false, ...stats, source: "apify-supabase" });
       }
+    } catch (e) {
+      console.error("Erreur Edge Function Supabase (get-market-price) :", e.message);
     }
- 
-    return res.json({
-      isDemo: true,
-      message: "Aucun fournisseur de données de marché configuré — réponse de démonstration.",
+
+    return res.status(500).json({
+      isDemo: false,
+      error: "Impossible de récupérer les données du marché en direct.",
     });
   });
  
@@ -240,10 +244,3 @@ module.exports = (pool) => {
  
   return router;
 };
- 
-
-
-
-
-
-
