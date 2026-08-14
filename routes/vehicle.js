@@ -1,9 +1,9 @@
 const express = require("express");
 const router = express.Router();
 const { requireAuth } = require("../middleware/auth");
-
+ 
 const FREE_WEEKLY_LIMIT = 3;
-
+ 
 // Décode les entités XML de base (&quot; &amp; &lt; &gt; &#39;) présentes dans
 // la réponse SOAP/ASMX de RegCheck avant de parser le JSON qu'elle contient.
 function decodeXmlEntities(str) {
@@ -14,13 +14,15 @@ function decodeXmlEntities(str) {
     .replace(/&#39;/g, "'")
     .replace(/&amp;/g, "&");
 }
-
+ 
 // Un VIN fait 17 caractères et ne contient jamais I, O ou Q (norme ISO 3779)
 function isVin(value) {
   return /^[A-HJ-NPR-Z0-9]{17}$/i.test(value.replace(/\s/g, ""));
 }
-
+ 
 // Décode un VIN via l'API officielle NHTSA (gratuite, sans clé, sans inscription).
+// Fonctionne pour les véhicules du monde entier grâce à la norme ISO 3779,
+// même si les données sont parfois moins complètes hors des véhicules vendus aux USA.
 async function decodeVin(vin) {
   const cleanVin = vin.replace(/\s/g, "").toUpperCase();
   const url = `https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVinValues/${encodeURIComponent(cleanVin)}?format=json`;
@@ -43,10 +45,12 @@ async function decodeVin(vin) {
     puissanceCh: r.EngineHP,
   };
 }
-
+ 
 const CACHE_VALIDITY_DAYS = 14;
-
-// Calcule médiane, moyenne, min/max et un score de confiance
+ 
+// Calcule médiane, moyenne, min/max et un score de confiance à partir d'une
+// liste de prix comparables. Ne dit RIEN sur l'origine de ces prix — cette
+// fonction est indépendante de la source (fournisseur licencié ou saisie manuelle).
 function computeMarketStats(prices) {
   if (!Array.isArray(prices) || prices.length === 0) return null;
   const sorted = [...prices].sort((a, b) => a - b);
@@ -56,6 +60,7 @@ function computeMarketStats(prices) {
   const mean = sorted.reduce((sum, p) => sum + p, 0) / n;
   const min = sorted[0];
   const max = sorted[n - 1];
+  // Confiance simple basée sur le nombre de comparables disponibles
   const confidence = n >= 20 ? "élevée" : n >= 8 ? "moyenne" : "faible";
   return {
     median: Math.round(median),
@@ -66,21 +71,25 @@ function computeMarketStats(prices) {
     confidence,
   };
 }
-
+ 
 module.exports = (pool) => {
-  // Identifie un véhicule à partir d'une plaque française ou d'un VIN
+  // Identifie un véhicule à partir d'une plaque française (RegCheck) ou d'un VIN (NHTSA, gratuit).
   router.post("/lookup", requireAuth, async (req, res) => {
     const { plate } = req.body;
     if (!plate) return res.status(400).json({ error: "Plaque ou VIN requis." });
-
+ 
+    // VIN : décodage gratuit, toujours tenté en premier si le format correspond
     if (isVin(plate)) {
       try {
         const vehicleData = await decodeVin(plate);
         return res.json(vehicleData);
       } catch (e) {
         console.error("Erreur décodage VIN (NHTSA) :", e.message);
+        // On retombe sur la démonstration ci-dessous plutôt que de bloquer l'utilisateur
       }
     } else if (process.env.VEHICLE_API_KEY) {
+      // Plaque française via RegCheck.org.uk (même fournisseur qu'ImmatriculationAPI.com).
+      // VEHICLE_API_KEY doit contenir le "username" du compte RegCheck.
       try {
         const cleanPlate = plate.replace(/[\s-]/g, "").toUpperCase();
         const url = `https://www.regcheck.org.uk/api/reg.asmx/CheckFrance?RegistrationNumber=${encodeURIComponent(cleanPlate)}&username=${encodeURIComponent(process.env.VEHICLE_API_KEY)}`;
@@ -92,23 +101,30 @@ module.exports = (pool) => {
         return res.json({ isDemo: false, plate: cleanPlate, ...vehicleData });
       } catch (e) {
         console.error("Erreur API plaque (RegCheck) :", e.message);
+        // On retombe sur la démonstration plutôt que de bloquer l'utilisateur
       }
     }
-
+ 
+    // Fallback démonstration tant qu'aucun fournisseur n'est configuré (ou en cas d'échec)
     return res.json({
       isDemo: true,
       message: "Aucun fournisseur réel configuré ou VIN non reconnu — réponse de démonstration.",
     });
   });
-
-  // Prix du marché — Appel direct à Apify (clearpath/leboncoin-api) via Render
+ 
+  // Prix du marché — vérifie d'abord le cache (moins de 14 jours), sinon
+  // interroge le fournisseur configuré (ex: MyTracks), sinon démonstration.
+  // Libellés à utiliser côté app : "Prix du marché", "Valeur de revente
+  // estimée", "Médiane des comparables" — jamais "Cote Argus".
   router.post("/market", requireAuth, async (req, res) => {
     const { brand, model, year, km, fuel } = req.body;
     if (!brand || !model || !year) {
       return res.status(400).json({ error: "Marque, modèle et année requis." });
     }
-
-    // 1. Vérification dans le cache PostgreSQL local
+    if (!km && process.env.MARKET_DATA_API_KEY) {
+      console.error("Avertissement : kilométrage manquant, MyTracks risque de ne renvoyer aucun résultat.");
+    }
+ 
     try {
       const cached = await pool.query(
         `SELECT * FROM market_prices_cache
@@ -133,72 +149,60 @@ module.exports = (pool) => {
     } catch (e) {
       console.error("Erreur lecture cache marché :", e.message);
     }
-
-    // 2. Appel direct à Apify via Render (clearpath/leboncoin-api)
-    try {
-      const apifyToken = process.env.MARKET_DATA_API_KEY;
-      if (!apifyToken) {
-        throw new Error("Clé MARKET_DATA_API_KEY absente sur Render.");
-      }
-
-      const apifyActorId = "clearpath/leboncoin-api";
-      const apifyUrl = `https://api.apify.com/v2/acts/${apifyActorId}/run-sync-get-dataset-items?token=${apifyToken}`;
-
-      const response = await fetch(apifyUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          query: `${brand} ${model} ${year}`.trim(),
-          category: "voitures",
-          maxItems: 20
-        })
-      });
-
-      const items = await response.json();
-
-      if (Array.isArray(items) && items.length > 0) {
-        // Extraction des prix réels retournés par LeBonCoin via Apify
-        const prices = items
-          .map((item) => parseFloat(item.price || item.prix || (item.priceCents ? item.priceCents / 100 : null)))
-          .filter((price) => !isNaN(price) && price > 0);
-
-        const stats = computeMarketStats(prices);
-
-        if (stats) {
-          // Sauvegarde dans le cache local PostgreSQL
-          try {
-            await pool.query(
-              `INSERT INTO market_prices_cache (brand, model, year, median_price, mean_price, min_price, max_price, comparables_count, source)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'apify-direct')`,
-              [brand, model, year, stats.median, stats.mean, stats.min, stats.max, stats.comparablesCount]
-            );
-          } catch (cacheErr) {
-            console.error("Erreur écriture cache :", cacheErr.message);
-          }
-
-          return res.json({
-            isDemo: false,
-            fromCache: false,
-            ...stats,
-            source: "apify-direct",
-          });
+ 
+    if (process.env.MARKET_DATA_API_KEY) {
+      try {
+        const providerRes = await fetch("https://api.mytracks.fr/v1/pricing", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-API-Key": process.env.MARKET_DATA_API_KEY,
+          },
+          body: JSON.stringify({
+            brand,
+            model,
+            year: Number(year),
+            mileage: km ? Number(km) : undefined,
+            fuel: fuel || undefined,
+          }),
+        });
+        const data = await providerRes.json();
+ 
+        // Le format réel de MyTracks est { "predictions": [...] } — chaque
+        // élément du tableau est une estimation individuelle (un "prix
+        // comparable"). On calcule nos propres statistiques dessus avec
+        // computeMarketStats, plutôt que de chercher des champs agrégés.
+        const predictions = Array.isArray(data.predictions) ? data.predictions : [];
+        const prices = predictions
+          .map((p) => p.price ?? p.estimated_price ?? p.value)
+          .filter((p) => typeof p === "number");
+ 
+        if (prices.length > 0) {
+          const stats = computeMarketStats(prices);
+          await pool.query(
+            `INSERT INTO market_prices_cache (brand, model, year, median_price, mean_price, min_price, max_price, comparables_count, source)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'mytracks')`,
+            [brand, model, year, stats.median, stats.mean, stats.min, stats.max, stats.comparablesCount]
+          );
+          return res.json({ isDemo: false, fromCache: false, ...stats, source: "mytracks" });
         }
+        console.error("Réponse MyTracks inattendue ou vide, à vérifier :", JSON.stringify(data));
+      } catch (e) {
+        console.error("Erreur API marché (MyTracks) :", e.message);
       }
-    } catch (e) {
-      console.error("Erreur appel Apify direct sur Render :", e.message);
     }
-
-    return res.status(500).json({
-      isDemo: false,
-      error: "Impossible de récupérer les données du marché en direct.",
+ 
+    return res.json({
+      isDemo: true,
+      message: "Aucun fournisseur de données de marché configuré — réponse de démonstration.",
     });
   });
-
-  // Enregistre une analyse
+ 
+  // Enregistre une analyse : vérifie le quota gratuit (3/semaine), incrémente le compteur.
   router.post("/analyses", requireAuth, async (req, res) => {
     const userResult = await pool.query("SELECT is_premium FROM users WHERE email = $1", [req.userEmail]);
     const isPremium = userResult.rows[0]?.is_premium;
-
+ 
     if (!isPremium) {
       const countResult = await pool.query(
         "SELECT COUNT(*) FROM analyses WHERE user_email = $1 AND created_at > now() - interval '7 days'",
@@ -209,7 +213,7 @@ module.exports = (pool) => {
         return res.status(403).json({ error: "Quota gratuit atteint (3 analyses/semaine). Passe Premium pour continuer." });
       }
     }
-
+ 
     const { vehicleName, plate, purchasePrice, margin, score, verdict } = req.body;
     const result = await pool.query(
       `INSERT INTO analyses (user_email, vehicle_name, plate, purchase_price, margin, score, verdict)
@@ -219,8 +223,8 @@ module.exports = (pool) => {
     await pool.query("UPDATE users SET analyses_count = analyses_count + 1 WHERE email = $1", [req.userEmail]);
     res.json(result.rows[0]);
   });
-
-  // Historique des analyses
+ 
+  // Historique des analyses de l'utilisateur connecté
   router.get("/analyses", requireAuth, async (req, res) => {
     const result = await pool.query(
       "SELECT * FROM analyses WHERE user_email = $1 ORDER BY created_at DESC",
@@ -228,6 +232,7 @@ module.exports = (pool) => {
     );
     res.json(result.rows);
   });
-
+ 
   return router;
 };
+ 
