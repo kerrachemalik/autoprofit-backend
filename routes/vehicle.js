@@ -117,7 +117,7 @@ module.exports = (pool) => {
   // Libellés à utiliser côté app : "Prix du marché", "Valeur de revente
   // estimée", "Médiane des comparables" — jamais "Cote Argus".
   router.post("/market", requireAuth, async (req, res) => {
-    const { brand, model, year } = req.body;
+    const { brand, model, year, km, fuel } = req.body;
     if (!brand || !model || !year) {
       return res.status(400).json({ error: "Marque, modèle et année requis." });
     }
@@ -149,18 +149,30 @@ module.exports = (pool) => {
  
     if (process.env.MARKET_DATA_API_KEY) {
       try {
-        const url = `https://api.carapi.dev/v1/vehicle-valuation?token=${encodeURIComponent(process.env.MARKET_DATA_API_KEY)}&make=${encodeURIComponent(brand)}&model=${encodeURIComponent(model)}&year=${encodeURIComponent(year)}&country=FR`;
-        const providerRes = await fetch(url);
+        const providerRes = await fetch("https://api.mytracks.fr/v1/pricing", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-API-Key": process.env.MARKET_DATA_API_KEY,
+          },
+          body: JSON.stringify({
+            brand,
+            model,
+            year: Number(year),
+            mileage: km ? Number(km) : undefined,
+            fuel: fuel || undefined,
+          }),
+        });
         const data = await providerRes.json();
  
-        // Le format exact de réponse de CarAPI.dev n'a pas pu être vérifié à
+        // Le format exact de réponse de MyTracks n'a pas pu être vérifié à
         // l'avance — on tente plusieurs noms de champs courants. Si aucun ne
         // correspond, le message loggué ci-dessous montrera la vraie forme
         // de la réponse pour ajuster ce mapping précisément.
-        const median = data.median_price ?? data.median ?? data.medianPrice;
+        const median = data.price ?? data.median_price ?? data.median ?? data.estimated_price ?? data.medianPrice;
         const mean = data.average_price ?? data.mean ?? data.averagePrice;
-        const min = data.min_price ?? data.min ?? data.minPrice;
-        const max = data.max_price ?? data.max ?? data.maxPrice;
+        const min = data.min_price ?? data.price_min ?? data.min ?? data.minPrice;
+        const max = data.max_price ?? data.price_max ?? data.max ?? data.maxPrice;
         const count = data.sample_size ?? data.comparablesCount ?? data.count ?? 0;
  
         if (median != null) {
@@ -174,14 +186,14 @@ module.exports = (pool) => {
           };
           await pool.query(
             `INSERT INTO market_prices_cache (brand, model, year, median_price, mean_price, min_price, max_price, comparables_count, source)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'carapi')`,
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'mytracks')`,
             [brand, model, year, stats.median, stats.mean, stats.min, stats.max, stats.comparablesCount]
           );
-          return res.json({ isDemo: false, fromCache: false, ...stats, source: "carapi" });
+          return res.json({ isDemo: false, fromCache: false, ...stats, source: "mytracks" });
         }
-        console.error("Réponse CarAPI inattendue, à vérifier :", JSON.stringify(data));
+        console.error("Réponse MyTracks inattendue, à vérifier :", JSON.stringify(data));
       } catch (e) {
-        console.error("Erreur API marché (CarAPI.dev) :", e.message);
+        console.error("Erreur API marché (MyTracks) :", e.message);
       }
     }
  
@@ -228,3 +240,10 @@ module.exports = (pool) => {
  
   return router;
 };
+ 
+
+
+
+
+
+
