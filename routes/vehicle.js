@@ -1,5 +1,6 @@
 const express = require("express");
 const router = express.Router();
+const Anthropic = require("@anthropic-ai/sdk");
 const { requireAuth } = require("../middleware/auth");
  
 const FREE_WEEKLY_LIMIT = 3;
@@ -46,6 +47,50 @@ async function decodeVin(vin) {
   };
 }
  
+const anthropic = process.env.ANTHROPIC_API_KEY ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY }) : null;
+
+const PROBLEM_ESTIMATE_SCHEMA = {
+  type: "object",
+  properties: {
+    severityKey: { type: "string", enum: ["leger", "modere", "important", "critique"] },
+    minCost: { type: "integer" },
+    maxCost: { type: "integer" },
+    riskPct: { type: "number" },
+    explanation: { type: "string", description: "Une seule phrase en français, maximum 30 mots. Jamais plusieurs phrases ni de paragraphe." },
+  },
+  required: ["severityKey", "minCost", "maxCost", "riskPct", "explanation"],
+  additionalProperties: false,
+};
+
+const PHOTO_ESTIMATE_SCHEMA = {
+  type: "object",
+  properties: {
+    part: { type: "string" },
+    level: { type: "string", enum: ["yellow", "orange", "red"] },
+    label: { type: "string", description: "Description très courte du dégât, quelques mots (ex: 'Rayures superficielles')." },
+    min: { type: "integer" },
+    max: { type: "integer" },
+    explanation: { type: "string", description: "Une seule phrase en français, maximum 25 mots. Jamais plusieurs phrases ni de paragraphe." },
+  },
+  required: ["part", "level", "label", "min", "max", "explanation"],
+  additionalProperties: false,
+};
+
+function fallbackProblemEstimate() {
+  return {
+    severityKey: "modere", minCost: 300, maxCost: 900, riskPct: 0.02,
+    explanation: "Estimation par défaut (l'analyse IA n'a pas pu être obtenue) — ajuste la gravité manuellement si besoin.",
+  };
+}
+
+function fallbackPhotoEstimate() {
+  return {
+    part: "Dégât non identifié", level: "orange",
+    label: "Estimation par défaut (analyse IA indisponible)",
+    min: 200, max: 500, explanation: "",
+  };
+}
+
 const CACHE_VALIDITY_DAYS = 14;
  
 // Calcule médiane, moyenne, min/max et un score de confiance à partir d'une
@@ -198,6 +243,98 @@ module.exports = (pool) => {
     });
   });
  
+  // Analyse IA d'un problème mécanique décrit avec ses propres mots par l'utilisateur.
+  // Détermine la gravité et une fourchette de réparation réaliste pour ce véhicule précis.
+  router.post("/problem-estimate", requireAuth, async (req, res) => {
+    const { description, vehicle } = req.body;
+    if (!description || !vehicle) {
+      return res.status(400).json({ error: "'description' et 'vehicle' requis." });
+    }
+    if (!anthropic) return res.json(fallbackProblemEstimate());
+
+    const prompt = `Tu es un expert automobile en France. Un acheteur envisage ce véhicule : ${vehicle.name}, ${vehicle.year}, ${vehicle.km} km, moteur ${vehicle.fuel} ${vehicle.power}ch (${vehicle.fiscalPower} CV fiscaux), boîte ${vehicle.gearbox}.
+L'utilisateur décrit ce problème avec ses propres mots : "${description}".
+Étudie cette description et détermine toi-même la gravité la plus probable (severityKey), une fourchette de coût de réparation RÉALISTE en France (ne surestime jamais), et une décote de risque.
+
+Repères de calibration à respecter strictement :
+- Un pneu simplement dégonflé (pas crevé, pas usé) : gonflage gratuit ou quelques euros, severityKey "leger", coût proche de 0 €.
+- Un pneu crevé réparable (bouchon/mèche) : 15-30 €.
+- Un pneu à changer (usé, hernie) : 80-150 € pièce.
+- Un voyant allumé sans autre précision, une petite rayure, une ampoule grillée, un balai d'essuie-glace : quelques dizaines d'euros maximum, severityKey "leger".
+- Ne choisis "important" ou "critique" que si la description implique clairement une panne mécanique/moteur/boîte sérieuse.
+- N'invente jamais un problème plus grave que ce que l'utilisateur décrit réellement.
+- riskPct est une fraction de la valeur du véhicule, entre 0 et 0.1 (ex: 0.02 pour 2%).
+- explanation : UNE SEULE phrase courte (maximum 30 mots), pas de paragraphe, pas de conseils détaillés — juste la justification de l'estimation.`;
+
+    try {
+      const response = await anthropic.messages.create({
+        model: "claude-opus-5",
+        max_tokens: 2048,
+        output_config: { effort: "medium", format: { type: "json_schema", schema: PROBLEM_ESTIMATE_SCHEMA } },
+        messages: [{ role: "user", content: prompt }],
+      });
+      const textBlock = response.content.find((b) => b.type === "text");
+      const parsed = JSON.parse(textBlock.text);
+      return res.json({
+        severityKey: parsed.severityKey,
+        minCost: Math.max(0, Math.round(parsed.minCost)),
+        maxCost: Math.max(0, Math.round(parsed.maxCost)),
+        riskPct: Math.max(0, Math.min(0.1, parsed.riskPct)),
+        explanation: parsed.explanation,
+      });
+    } catch (e) {
+      console.error("Erreur estimation IA (problème) :", e.message);
+      return res.json(fallbackProblemEstimate());
+    }
+  });
+
+  // Analyse IA d'une photo de dégât esthétique/mécanique. Identifie la pièce
+  // concernée, la gravité et une fourchette de réparation réaliste.
+  router.post("/photo-estimate", requireAuth, async (req, res) => {
+    const { imageBase64, mediaType, vehicle } = req.body;
+    if (!imageBase64) return res.status(400).json({ error: "'imageBase64' requis." });
+    if (!anthropic) return res.json(fallbackPhotoEstimate());
+
+    const prompt = `Tu es un expert carrossier en France. Analyse cette photo d'un véhicule d'occasion${vehicle?.name ? ` (${vehicle.name}, ${vehicle.year})` : ""} et identifie le dégât esthétique ou mécanique visible le plus important sur la photo.
+
+Détermine :
+- la pièce concernée (ex: "Pare-choc avant", "Aile avant droite", "Portière arrière gauche", "Jante avant droite")
+- le niveau de gravité : "yellow" pour un dégât léger/esthétique (rayure superficielle, petite bosse), "orange" pour un dégât modéré (déformation, fissure), "red" pour un dégât grave nécessitant probablement un remplacement de pièce
+- une fourchette de coût de réparation RÉALISTE en France pour ce type de dégât (ne surestime jamais)
+
+Si la photo ne montre aucun dégât visible ou n'est pas exploitable, indique un niveau "yellow" avec un coût proche de 0 et explique-le dans "explanation".
+
+"label" : quelques mots seulement (ex: "Rayures superficielles"). "explanation" : UNE SEULE phrase courte (maximum 25 mots), pas de paragraphe.`;
+
+    try {
+      const response = await anthropic.messages.create({
+        model: "claude-opus-5",
+        max_tokens: 2048,
+        output_config: { effort: "medium", format: { type: "json_schema", schema: PHOTO_ESTIMATE_SCHEMA } },
+        messages: [{
+          role: "user",
+          content: [
+            { type: "image", source: { type: "base64", media_type: mediaType || "image/jpeg", data: imageBase64 } },
+            { type: "text", text: prompt },
+          ],
+        }],
+      });
+      const textBlock = response.content.find((b) => b.type === "text");
+      const parsed = JSON.parse(textBlock.text);
+      return res.json({
+        part: parsed.part,
+        level: parsed.level,
+        label: parsed.label,
+        min: Math.max(0, Math.round(parsed.min)),
+        max: Math.max(0, Math.round(parsed.max)),
+        explanation: parsed.explanation,
+      });
+    } catch (e) {
+      console.error("Erreur estimation IA (photo) :", e.message);
+      return res.json(fallbackPhotoEstimate());
+    }
+  });
+
   // Enregistre une analyse : vérifie le quota gratuit (3/semaine), incrémente le compteur.
   router.post("/analyses", requireAuth, async (req, res) => {
     const userResult = await pool.query("SELECT is_premium FROM users WHERE email = $1", [req.userEmail]);
