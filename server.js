@@ -35,7 +35,8 @@ app.use("/api/users", require("./routes/users")(pool));
 app.use("/api/messages", require("./routes/messages")(pool));
 app.use("/api/vehicle", require("./routes/vehicle")(pool));
 app.use("/api/iap", require("./routes/iap")(pool));
- 
+app.use("/api/search-cars", require("./routes/searchCars")(pool));
+
 // Gestion d'erreur générique (évite qu'une erreur ne fasse planter le serveur)
 app.use((err, req, res, next) => {
   console.error(err);
