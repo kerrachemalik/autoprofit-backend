@@ -27,6 +27,9 @@ CREATE TABLE IF NOT EXISTS analyses (
   margin          NUMERIC,
   score           INTEGER,
   verdict         TEXT,
+  -- Snapshot complet (véhicule, cote, comparables, verdict IA détaillé...) pour
+  -- pouvoir rouvrir une analyse passée telle qu'elle était, sans la refaire.
+  snapshot        JSONB,
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

@@ -74,6 +74,7 @@ module.exports = (pool) => {
           version: it.vehicle.version,
           gearbox: it.vehicle.gearbox,
           energy: it.vehicle.energy,
+          department: it.location?.visitPlace || "",
           photoUrl: it.photoUrl,
         }));
 
