@@ -269,7 +269,7 @@ Repères de calibration à respecter strictement :
     try {
       const response = await anthropic.messages.create({
         model: "claude-opus-5",
-        max_tokens: 2048,
+        max_tokens: 1024,
         output_config: { effort: "medium", format: { type: "json_schema", schema: PROBLEM_ESTIMATE_SCHEMA } },
         messages: [{ role: "user", content: prompt }],
       });
@@ -309,7 +309,7 @@ Si la photo ne montre aucun dégât visible ou n'est pas exploitable, indique un
     try {
       const response = await anthropic.messages.create({
         model: "claude-opus-5",
-        max_tokens: 2048,
+        max_tokens: 1024,
         output_config: { effort: "medium", format: { type: "json_schema", schema: PHOTO_ESTIMATE_SCHEMA } },
         messages: [{
           role: "user",
